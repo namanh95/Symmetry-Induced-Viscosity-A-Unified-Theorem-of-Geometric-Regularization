@@ -1,0 +1,323 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import lsq_linear
+
+# ============================================================
+# 1. Reproducibility
+# ============================================================
+np.random.seed(42)
+
+# ============================================================
+# 2. System Definition
+# ============================================================
+d = 3
+N_pairs = 12
+N = 2 * N_pairs
+u_lim = 0.35
+N_samples = 3000
+sigma_w = 2.5
+EPS = 1e-12
+
+# ============================================================
+# 3. Build a Symmetric Control Effectiveness Matrix M
+# ============================================================
+# Dimension 0 = symmetric channel
+# Dimensions 1,2 = antisymmetric channels
+M_left = np.random.randn(d, N_pairs)
+
+M_right = M_left.copy()
+M_right[1, :] *= -1.0
+M_right[2, :] *= -1.0
+
+M = np.hstack((M_left, M_right))
+
+# ============================================================
+# 4. Parity Transformation
+# ============================================================
+# z = [z_s, z_a],  u = T z
+T = np.zeros((N, N))
+for i in range(N_pairs):
+    # symmetric coordinate
+    T[i, i] = 1.0 / np.sqrt(2)
+    T[i, i + N_pairs] = 1.0 / np.sqrt(2)
+
+    # antisymmetric coordinate
+    T[i + N_pairs, i] = 1.0 / np.sqrt(2)
+    T[i + N_pairs, i + N_pairs] = -1.0 / np.sqrt(2)
+
+if not np.allclose(T @ T.T, np.eye(N), atol=1e-10):
+    raise ValueError("Parity transform T is not orthogonal.")
+
+# Parity-transformed control matrix
+M_parity = M @ T
+M_s = M_parity[:, :N_pairs]
+M_a = M_parity[:, N_pairs:]
+
+# ============================================================
+# 5. Engineered Symmetry Structure in Command Space
+# ============================================================
+sym_rows = np.array([0], dtype=int)
+anti_rows = np.array([1, 2], dtype=int)
+
+# Reduced active systems
+M_s_red = M_s[sym_rows, :]      # shape (1, N_pairs)
+M_a_red = M_a[anti_rows, :]     # shape (2, N_pairs)
+
+# Sanity diagnostics
+sym_leak = np.linalg.norm(M_s[anti_rows, :])
+anti_leak = np.linalg.norm(M_a[sym_rows, :])
+
+print("Symmetry diagnostics:")
+print(f"  ||antisymmetric rows inside M_s|| = {sym_leak:.3e}")
+print(f"  ||symmetric rows inside M_a||     = {anti_leak:.3e}")
+
+# ============================================================
+# 6. Solvers
+# ============================================================
+def solve_unaligned(target, M, u_lim):
+    """
+    Standard bounded least-squares allocation in raw coordinates.
+    """
+    res = lsq_linear(
+        M,
+        target,
+        bounds=(-u_lim, u_lim),
+        lsmr_tol='auto',
+        verbose=0
+    )
+    u = np.asarray(res.x).reshape(-1)
+    residual = M @ u - target
+    return u, residual, bool(res.success)
+
+def solve_aligned_factorized(target, M_s_red, M_a_red, T, M, u_lim):
+    """
+    Fast symmetry-aligned factorized allocation.
+
+    Uses the inscribed parity box:
+        |z_i| <= u_lim / sqrt(2)
+
+    This guarantees:
+        |u_i| <= u_lim
+    after mapping u = T z.
+    """
+    z_lim = u_lim / np.sqrt(2)
+
+    # Reduced targets
+    target_s = np.asarray(target[sym_rows]).reshape(-1)    # shape (1,)
+    target_a = np.asarray(target[anti_rows]).reshape(-1)   # shape (2,)
+
+    # Solve only on active channel rows
+    res_s = lsq_linear(
+        M_s_red,
+        target_s,
+        bounds=(-z_lim, z_lim),
+        lsmr_tol='auto',
+        verbose=0
+    )
+    res_a = lsq_linear(
+        M_a_red,
+        target_a,
+        bounds=(-z_lim, z_lim),
+        lsmr_tol='auto',
+        verbose=0
+    )
+
+    z_s = np.asarray(res_s.x).reshape(-1)
+    z_a = np.asarray(res_a.x).reshape(-1)
+
+    if z_s.shape[0] != N_pairs or z_a.shape[0] != N_pairs:
+        raise ValueError("Unexpected parity solution size.")
+
+    z = np.concatenate((z_s, z_a))
+    u = T @ z
+
+    # Feasibility should hold by construction
+    feasible = np.all(np.abs(u) <= u_lim + 1e-8)
+
+    # Define residual exactly the same way as the unaligned case
+    residual = M @ u - target
+
+    success = bool(res_s.success and res_a.success and feasible)
+    return u, z, residual, success
+
+# ============================================================
+# 7. Monte Carlo Simulation
+# ============================================================
+w_disturbances = np.random.normal(0.0, sigma_w, size=(N_samples, d))
+
+residual_unaligned = np.zeros((N_samples, d))
+residual_aligned = np.zeros((N_samples, d))
+
+u_unaligned_all = np.zeros((N_samples, N))
+u_aligned_all = np.zeros((N_samples, N))
+
+success_flags = np.zeros(N_samples, dtype=bool)
+
+print("\nSimulating stochastic disturbances and constrained allocations...")
+
+for i in range(N_samples):
+    w = w_disturbances[i]
+    target = -w
+
+    # Method A: unaligned allocation
+    u_un, res_un, success_un = solve_unaligned(target, M, u_lim)
+    residual_unaligned[i, :] = res_un
+    u_unaligned_all[i, :] = u_un
+
+    # Method B: symmetry-aligned factorized allocation
+    u_al, z_al, res_al, success_al = solve_aligned_factorized(
+        target, M_s_red, M_a_red, T, M, u_lim
+    )
+    residual_aligned[i, :] = res_al
+    u_aligned_all[i, :] = u_al
+    success_flags[i] = success_al
+
+success_rate = success_flags.mean()
+
+# ============================================================
+# 8. Metrics
+# ============================================================
+def sample_cov(X):
+    X = np.asarray(X)
+    Xc = X - X.mean(axis=0, keepdims=True)
+    denom = max(X.shape[0] - 1, 1)
+    return (Xc.T @ Xc) / denom
+
+cov_unaligned = sample_cov(residual_unaligned)
+cov_aligned = sample_cov(residual_aligned)
+
+eig_unaligned = np.linalg.eigvalsh(cov_unaligned)
+eig_aligned = np.linalg.eigvalsh(cov_aligned)
+
+lambda_max_un = max(float(eig_unaligned[-1]), EPS)
+lambda_max_al = max(float(eig_aligned[-1]), EPS)
+
+trace_un = float(np.trace(cov_unaligned))
+trace_al = float(np.trace(cov_aligned))
+
+C_geom_un = 1.0 / lambda_max_un
+C_geom_al = 1.0 / lambda_max_al
+
+# Tail metrics
+norm_unaligned = np.linalg.norm(residual_unaligned, axis=1)
+norm_aligned = np.linalg.norm(residual_aligned, axis=1)
+
+q95_un = float(np.quantile(norm_unaligned, 0.95))
+q95_al = float(np.quantile(norm_aligned, 0.95))
+
+q99_un = float(np.quantile(norm_unaligned, 0.99))
+q99_al = float(np.quantile(norm_aligned, 0.99))
+
+thresholds = np.linspace(
+    0.0,
+    max(float(norm_unaligned.max()), float(norm_aligned.max())),
+    120
+)
+
+ccdf_un = np.array([(norm_unaligned >= t).mean() for t in thresholds], dtype=float)
+ccdf_al = np.array([(norm_aligned >= t).mean() for t in thresholds], dtype=float)
+
+# Avoid log(0) on semilog axis
+ccdf_floor = 1.0 / N_samples
+ccdf_un_plot = np.maximum(ccdf_un, ccdf_floor)
+ccdf_al_plot = np.maximum(ccdf_al, ccdf_floor)
+
+# Saturation statistics
+def saturation_fraction(U, u_lim, tol=1e-4):
+    hit = np.abs(np.abs(U) - u_lim) <= tol
+    return float(hit.mean())
+
+sat_un = saturation_fraction(u_unaligned_all, u_lim)
+sat_al = saturation_fraction(u_aligned_all, u_lim)
+
+mean_util_un = float(np.mean(np.abs(u_unaligned_all)) / max(u_lim, EPS))
+mean_util_al = float(np.mean(np.abs(u_aligned_all)) / max(u_lim, EPS))
+
+# Modal residual energies
+sym_energy_un = float(np.mean(residual_unaligned[:, 0] ** 2))
+anti_energy_un = float(np.mean(residual_unaligned[:, 1] ** 2 + residual_unaligned[:, 2] ** 2))
+
+sym_energy_al = float(np.mean(residual_aligned[:, 0] ** 2))
+anti_energy_al = float(np.mean(residual_aligned[:, 1] ** 2 + residual_aligned[:, 2] ** 2))
+
+# ============================================================
+# 9. Printed Results
+# ============================================================
+print("\n" + "=" * 72)
+print("GEOMETRIC CAPACITY CASE STUDY: SYMMETRY-ALIGNED ALLOCATION")
+print("=" * 72)
+print(f"Aligned optimizer success rate             : {success_rate:.4f}")
+print("-" * 72)
+print(f"lambda_max(Sigma_res) unaligned            : {lambda_max_un:.6f}")
+print(f"lambda_max(Sigma_res) aligned              : {lambda_max_al:.6f}")
+print(f"Spectral reduction                         : {(1 - lambda_max_al / lambda_max_un) * 100:.2f}%")
+print("-" * 72)
+print(f"trace(Sigma_res) unaligned                 : {trace_un:.6f}")
+print(f"trace(Sigma_res) aligned                   : {trace_al:.6f}")
+print(f"Trace reduction                            : {(1 - trace_al / max(trace_un, EPS)) * 100:.2f}%")
+print("-" * 72)
+print(f"Empirical geometric capacity unaligned     : {C_geom_un:.6f}")
+print(f"Empirical geometric capacity aligned       : {C_geom_al:.6f}")
+print(f"Capacity gain factor                       : {C_geom_al / max(C_geom_un, EPS):.4f}")
+print("-" * 72)
+print(f"95th percentile residual norm unaligned    : {q95_un:.6f}")
+print(f"95th percentile residual norm aligned      : {q95_al:.6f}")
+print(f"95th percentile reduction                  : {(1 - q95_al / max(q95_un, EPS)) * 100:.2f}%")
+print(f"99th percentile residual norm unaligned    : {q99_un:.6f}")
+print(f"99th percentile residual norm aligned      : {q99_al:.6f}")
+print(f"99th percentile reduction                  : {(1 - q99_al / max(q99_un, EPS)) * 100:.2f}%")
+print("-" * 72)
+print(f"Mean actuator utilization unaligned        : {mean_util_un:.4f}")
+print(f"Mean actuator utilization aligned          : {mean_util_al:.4f}")
+print(f"Saturation fraction unaligned              : {sat_un:.4f}")
+print(f"Saturation fraction aligned                : {sat_al:.4f}")
+print("=" * 72)
+
+# ============================================================
+# 10. Visualization
+# ============================================================
+fig = plt.figure(figsize=(14, 10))
+
+# Panel 1: control effectiveness matrix
+ax1 = plt.subplot(2, 2, 1)
+im1 = ax1.imshow(M, aspect='auto', interpolation='none')
+ax1.set_title("Symmetric Control Effectiveness Matrix $M$")
+ax1.set_xlabel("Actuator index")
+ax1.set_ylabel("Command dimension")
+plt.colorbar(im1, ax=ax1)
+
+# Panel 2: residual covariance spectrum
+ax2 = plt.subplot(2, 2, 2)
+ax2.plot(np.sort(eig_unaligned)[::-1], marker='o', label='Unaligned')
+ax2.plot(np.sort(eig_aligned)[::-1], marker='s', label='Symmetry-aligned')
+ax2.set_title("Residual Covariance Spectrum")
+ax2.set_xlabel("Eigenvalue rank")
+ax2.set_ylabel("Eigenvalue")
+ax2.grid(True, alpha=0.3)
+ax2.legend()
+
+# Panel 3: modal residual energy
+ax3 = plt.subplot(2, 2, 3)
+labels = ['Symmetric channel', 'Antisymmetric channels']
+x = np.arange(len(labels))
+width = 0.35
+ax3.bar(x - width / 2, [sym_energy_un, anti_energy_un], width, label='Unaligned')
+ax3.bar(x + width / 2, [sym_energy_al, anti_energy_al], width, label='Symmetry-aligned')
+ax3.set_xticks(x)
+ax3.set_xticklabels(labels)
+ax3.set_ylabel("Mean squared residual energy")
+ax3.set_title("Residual Energy by Command Channel")
+ax3.legend()
+
+# Panel 4: tail-risk CCDF
+ax4 = plt.subplot(2, 2, 4)
+ax4.semilogy(thresholds, ccdf_un_plot, linewidth=2, label='Unaligned')
+ax4.semilogy(thresholds, ccdf_al_plot, linewidth=2, label='Symmetry-aligned')
+ax4.set_title("Tail Exceedance of Residual Norm")
+ax4.set_xlabel("Threshold t")
+ax4.set_ylabel("Exceedance probability P(||y_res|| >= t)")
+ax4.grid(True, which='both', linestyle='--', alpha=0.4)
+ax4.legend()
+
+plt.tight_layout()
+plt.show()
