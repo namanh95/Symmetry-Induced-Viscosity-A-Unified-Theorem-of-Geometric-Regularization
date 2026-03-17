@@ -1,0 +1,264 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import eigh
+
+# ============================================================
+# 1. Reproducibility
+# ============================================================
+np.random.seed(42)
+
+# ============================================================
+# 2. Symmetric Network Construction
+# ============================================================
+N = 200
+half = N // 2
+
+# Symmetric two-sector architecture
+p_internal = 0.10
+p_cross = 0.02
+
+A = np.zeros((N, N))
+
+# Build one sector, mirror it
+block = np.random.binomial(1, p_internal, (half, half))
+block = np.triu(block, 1)
+block = block + block.T
+
+cross = np.random.binomial(1, p_cross, (half, half))
+
+A[:half, :half] = block
+A[half:, half:] = block.copy()
+A[:half, half:] = cross
+A[half:, :half] = cross.T
+
+A = np.maximum(A, A.T)
+np.fill_diagonal(A, 0)
+
+# Ensure connectedness by adding weak ring structure if needed
+for i in range(N):
+    A[i, (i + 1) % N] = 1
+    A[(i + 1) % N, i] = 1
+
+# ============================================================
+# 3. Graph Operators
+# ============================================================
+deg = A.sum(axis=1)
+D = np.diag(deg)
+L = D - A
+
+# Symmetric normalized Laplacian
+deg_safe = np.where(deg > 0, deg, 1.0)
+D_inv_sqrt = np.diag(1.0 / np.sqrt(deg_safe))
+L_norm = np.eye(N) - D_inv_sqrt @ A @ D_inv_sqrt
+
+eigvals, eigvecs = eigh(L_norm)
+lambda_2 = eigvals[1]
+
+# ============================================================
+# 4. Symmetry Basis: symmetric / antisymmetric coordinates
+# ============================================================
+# For each mirrored pair (i, i+half):
+# s_i = (x_i + x_{i+half}) / sqrt(2)
+# a_i = (x_i - x_{i+half}) / sqrt(2)
+T = np.zeros((N, N))
+for i in range(half):
+    T[i, i] = 1 / np.sqrt(2)
+    T[i, i + half] = 1 / np.sqrt(2)
+    T[i + half, i] = 1 / np.sqrt(2)
+    T[i + half, i + half] = -1 / np.sqrt(2)
+
+# Orthogonal transform check
+assert np.allclose(T @ T.T, np.eye(N), atol=1e-10)
+
+# Projectors in original coordinates
+P_sym = T.T @ np.diag(np.r_[np.ones(half), np.zeros(half)]) @ T
+P_anti = T.T @ np.diag(np.r_[np.zeros(half), np.ones(half)]) @ T
+
+# ============================================================
+# 5. Simulate Graph Time Series
+# ============================================================
+# We simulate a stable graph autoregressive process:
+# x_{t+1} = B x_t + eps_t
+# with stronger noise injected in antisymmetric modes
+#
+# This is designed to model disturbance amplification in imbalance channels.
+alpha = 0.18
+B = np.eye(N) - alpha * L_norm
+
+# Noise covariance in modal coordinates:
+# symmetric modes get lower variance, antisymmetric get higher variance
+sigma_sym = 0.25
+sigma_anti = 0.55
+
+Sigma_modal = np.diag(np.r_[sigma_sym**2 * np.ones(half),
+                            sigma_anti**2 * np.ones(half)])
+Sigma_eps = T.T @ Sigma_modal @ T
+
+T_steps = 2500
+burn_in = 300
+
+X = np.zeros((T_steps, N))
+x = np.random.randn(N) * 0.1
+
+for t in range(T_steps):
+    eps_t = np.random.multivariate_normal(mean=np.zeros(N), cov=Sigma_eps)
+    x = B @ x + eps_t
+    X[t] = x
+
+X = X[burn_in:]
+T_eff = X.shape[0]
+
+# One-step pairs
+X_t = X[:-1]
+X_next = X[1:]
+
+# ============================================================
+# 6. Baseline Predictor
+# ============================================================
+# Simple graph-linear predictor using known B
+# residual: r_t = x_{t+1} - B x_t
+baseline_pred = X_t @ B.T
+R_baseline = X_next - baseline_pred
+
+# ============================================================
+# 7. Symmetry-Aware Predictor
+# ============================================================
+# Transform into modal coordinates, apply stronger damping to antisymmetric modes
+# to emulate symmetry-aligned allocation / filtering.
+X_t_modal = X_t @ T.T
+X_next_modal = X_next @ T.T
+
+# Modal dynamics matrix in modal coordinates
+B_modal = T @ B @ T.T
+
+# Extra symmetry-aware contraction in antisymmetric channels
+gamma_anti = 0.35  # stronger filtering in imbalance modes
+filter_diag = np.r_[np.ones(half), (1.0 - gamma_anti) * np.ones(half)]
+F_modal = np.diag(filter_diag)
+
+B_geom_modal = F_modal @ B_modal
+
+geom_pred_modal = X_t_modal @ B_geom_modal.T
+R_geom_modal = X_next_modal - geom_pred_modal
+R_geom = R_geom_modal @ T
+
+# ============================================================
+# 8. Residual Covariances and Geometric Capacity
+# ============================================================
+def sample_cov(X):
+    Xc = X - X.mean(axis=0, keepdims=True)
+    return (Xc.T @ Xc) / (Xc.shape[0] - 1)
+
+Sigma_res_baseline = sample_cov(R_baseline)
+Sigma_res_geom = sample_cov(R_geom)
+
+evals_base = np.linalg.eigvalsh(Sigma_res_baseline)
+evals_geom = np.linalg.eigvalsh(Sigma_res_geom)
+
+lam_max_base = evals_base[-1]
+lam_max_geom = evals_geom[-1]
+
+trace_base = np.trace(Sigma_res_baseline)
+trace_geom = np.trace(Sigma_res_geom)
+
+# Operational geometric capacity proxy
+C_geom_base = 1.0 / lam_max_base
+C_geom_sym = 1.0 / lam_max_geom
+
+# ============================================================
+# 9. Tail Exceedance Curves
+# ============================================================
+norm_base = np.linalg.norm(R_baseline, axis=1)
+norm_geom = np.linalg.norm(R_geom, axis=1)
+
+# Common threshold grid
+q_low = min(np.quantile(norm_base, 0.70), np.quantile(norm_geom, 0.70))
+q_high = max(np.quantile(norm_base, 0.995), np.quantile(norm_geom, 0.995))
+thresholds = np.linspace(q_low, q_high, 80)
+
+tail_base = np.array([(norm_base >= u).mean() for u in thresholds])
+tail_geom = np.array([(norm_geom >= u).mean() for u in thresholds])
+
+# ============================================================
+# 10. Modal Energy Comparison
+# ============================================================
+sym_energy_base = np.mean(np.sum((R_baseline @ T.T)[:, :half]**2, axis=1))
+anti_energy_base = np.mean(np.sum((R_baseline @ T.T)[:, half:]**2, axis=1))
+
+sym_energy_geom = np.mean(np.sum(R_geom_modal[:, :half]**2, axis=1))
+anti_energy_geom = np.mean(np.sum(R_geom_modal[:, half:]**2, axis=1))
+
+# ============================================================
+# 11. Print Summary Statistics
+# ============================================================
+print("=" * 70)
+print("CASE STUDY SUMMARY: GEOMETRIC CAPACITY UNDER SYMMETRY-AWARE FILTERING")
+print("=" * 70)
+print(f"Number of nodes                     : {N}")
+print(f"Algebraic connectivity lambda_2     : {lambda_2:.6f}")
+print(f"Baseline lambda_max(Sigma_res)      : {lam_max_base:.6f}")
+print(f"Symmetry-aware lambda_max(Sigma_res): {lam_max_geom:.6f}")
+print(f"Baseline trace(Sigma_res)           : {trace_base:.6f}")
+print(f"Symmetry-aware trace(Sigma_res)     : {trace_geom:.6f}")
+print(f"Baseline geometric capacity         : {C_geom_base:.6f}")
+print(f"Symmetry-aware geometric capacity   : {C_geom_sym:.6f}")
+print(f"Capacity gain factor                : {C_geom_sym / C_geom_base:.3f}")
+print(f"Tail 95th percentile baseline       : {np.quantile(norm_base, 0.95):.6f}")
+print(f"Tail 95th percentile symmetry-aware : {np.quantile(norm_geom, 0.95):.6f}")
+print("=" * 70)
+
+# ============================================================
+# 12. Visualization
+# ============================================================
+fig = plt.figure(figsize=(16, 11))
+
+# ------------------------------------------------------------
+# Panel 1: Adjacency matrix
+# ------------------------------------------------------------
+ax1 = plt.subplot(2, 2, 1)
+im = ax1.imshow(A, interpolation="none", aspect="auto")
+ax1.set_title("Symmetric Network Adjacency")
+ax1.set_xlabel("Node index")
+ax1.set_ylabel("Node index")
+plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+
+# ------------------------------------------------------------
+# Panel 2: Residual covariance spectra
+# ------------------------------------------------------------
+ax2 = plt.subplot(2, 2, 2)
+ax2.plot(np.sort(evals_base)[::-1], label="Baseline")
+ax2.plot(np.sort(evals_geom)[::-1], label="Symmetry-aware")
+ax2.set_title("Residual Covariance Spectrum")
+ax2.set_xlabel("Eigenvalue rank")
+ax2.set_ylabel("Eigenvalue")
+ax2.legend()
+
+# ------------------------------------------------------------
+# Panel 3: Modal residual energy
+# ------------------------------------------------------------
+ax3 = plt.subplot(2, 2, 3)
+labels = ["Symmetric modes", "Antisymmetric modes"]
+xpos = np.arange(len(labels))
+width = 0.35
+
+ax3.bar(xpos - width / 2, [sym_energy_base, anti_energy_base], width, label="Baseline")
+ax3.bar(xpos + width / 2, [sym_energy_geom, anti_energy_geom], width, label="Symmetry-aware")
+ax3.set_xticks(xpos)
+ax3.set_xticklabels(labels)
+ax3.set_ylabel("Mean modal residual energy")
+ax3.set_title("Residual Energy by Invariant Channel")
+ax3.legend()
+
+# ------------------------------------------------------------
+# Panel 4: Tail exceedance curves
+# ------------------------------------------------------------
+ax4 = plt.subplot(2, 2, 4)
+ax4.semilogy(thresholds, tail_base, label="Baseline")
+ax4.semilogy(thresholds, tail_geom, label="Symmetry-aware")
+ax4.set_title("Tail Exceedance of Residual Norm")
+ax4.set_xlabel("Threshold u")
+ax4.set_ylabel("P(||r_t|| >= u)")
+ax4.legend()
+
+plt.tight_layout()
+plt.show()
